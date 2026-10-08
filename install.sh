@@ -6,8 +6,10 @@ set -euo pipefail
 
 REPO_RAW="${OP_REPO_RAW:-https://raw.githubusercontent.com/OfficialOnePesewa/vps-optimizer/main}"
 DEST="/opt/op-optimizer"
-FILES=(bin/op-optimizer bin/op-badvpn config/sysctl-lowlatency.conf config/badvpn.env
-       systemd/badvpn@.service systemd/op-optimizer-net.service uninstall.sh)
+FILES=(bin/op-optimizer bin/op-badvpn bin/op-keepalive
+       config/sysctl-lowlatency.conf config/badvpn.env config/keepalive.env
+       systemd/badvpn@.service systemd/op-optimizer-net.service
+       systemd/op-keepalive.service systemd/op-keepalive.timer uninstall.sh)
 
 DO_TUNE=1; DO_BADVPN=1; PORTS=""
 while [ $# -gt 0 ]; do
@@ -28,7 +30,7 @@ command -v apt-get >/dev/null 2>&1 || die "Only Debian/Ubuntu supported."
 export DEBIAN_FRONTEND=noninteractive
 echo "==> Installing base packages"
 apt-get update -y >/dev/null 2>&1 || warn "apt update had errors"
-apt-get install -y curl ca-certificates iproute2 procps ethtool irqbalance >/dev/null 2>&1 \
+apt-get install -y curl ca-certificates iproute2 procps ethtool irqbalance iputils-ping >/dev/null 2>&1 \
   || die "Base packages failed"
 
 SRC_DIR=""
@@ -45,6 +47,7 @@ done
 chmod +x "$DEST"/bin/* "$DEST/uninstall.sh"
 ln -sf "$DEST/bin/op-optimizer" /usr/local/bin/op-optimizer
 ln -sf "$DEST/bin/op-badvpn"    /usr/local/bin/op-badvpn
+ln -sf "$DEST/bin/op-keepalive" /usr/local/bin/op-keepalive
 ok "Installed to $DEST"
 
 [ "$DO_TUNE" -eq 1 ]   && /usr/local/bin/op-optimizer apply
