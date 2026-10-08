@@ -1,5 +1,5 @@
 # OP VPS Optimizer
-BBR + low-latency tuning and public BadVPN UDPGW for VoIP, gaming and streaming.
+BBR + low-latency tuning, keep-alive pinger and public BadVPN UDPGW for streaming, VoIP and gaming.
 By **OP Data Solutions** (@OfficialOnePesewa)
 
 ## Install
@@ -15,14 +15,18 @@ vps-optimizer/
 ├── uninstall.sh
 ├── README.md
 ├── bin/
-│   ├── op-optimizer          # tuning menu/CLI
-│   └── op-badvpn             # BadVPN manager
+│   ├── op-optimizer        # tuning menu/CLI
+│   ├── op-badvpn           # BadVPN manager
+│   └── op-keepalive        # 2-minute ping keep-alive
 ├── config/
-│   ├── sysctl-lowlatency.conf  # BBR + low-latency template
-│   └── badvpn.env              # BIND=0.0.0.0, ports, limits
+│   ├── sysctl-lowlatency.conf
+│   ├── badvpn.env
+│   └── keepalive.env
 └── systemd/
-    ├── badvpn@.service         # one instance per port
-    └── op-optimizer-net.service # boot-time qdisc/NIC tuning
+    ├── badvpn@.service
+    ├── op-optimizer-net.service
+    ├── op-keepalive.service
+    └── op-keepalive.timer
 ```
 
 ## Commands
