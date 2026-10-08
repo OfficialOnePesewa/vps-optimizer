@@ -1,0 +1,6 @@
+[Unit]
+Description=OP keep-alive ping
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/op-keepalive
