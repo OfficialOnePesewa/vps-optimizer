@@ -1,0 +1,10 @@
+[Unit]
+Description=OP keep-alive every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
