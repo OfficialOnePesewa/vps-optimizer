@@ -33,6 +33,11 @@ do_apply() {
       echo "PREV_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)"; } > "$PREV_FILE"
   fi
 
+  # remove old duplicate lines from earlier optimizer scripts (they override the new values)
+  if [ -f /etc/sysctl.conf ]; then
+    sed -i -E '/^net\.core\.(rmem_max|wmem_max|rmem_default|wmem_default|netdev_max_backlog)[[:space:]]*=/d;/^net\.core\.default_qdisc[[:space:]]*=[[:space:]]*fq[[:space:]]*$/d;/^net\.ipv4\.tcp_congestion_control[[:space:]]*=[[:space:]]*bbr[[:space:]]*$/d' /etc/sysctl.conf
+  fi
+
   modprobe tcp_bbr 2>/dev/null; modprobe sch_fq 2>/dev/null
   local cc="cubic" qd="fq_codel"
   if has_bbr; then cc="bbr"; qd="fq"
@@ -72,6 +77,16 @@ L
     [ -e "$g" ] && echo performance > "$g" 2>/dev/null
   done
   if command -v irqbalance >/dev/null 2>&1; then systemctl enable --now irqbalance >/dev/null 2>&1; fi
+
+  # keep-alive pinger (every 2 minutes)
+  cp -f "$ROOT/systemd/op-keepalive.service" /etc/systemd/system/
+  cp -f "$ROOT/systemd/op-keepalive.timer" /etc/systemd/system/
+  [ -f "$CONF_DIR/keepalive.env" ] || cp -f "$ROOT/config/keepalive.env" "$CONF_DIR/keepalive.env"
+  ln -sf "$ROOT/bin/op-keepalive" /usr/local/bin/op-keepalive
+  systemctl daemon-reload
+  systemctl enable --now op-keepalive.timer >/dev/null 2>&1
+  ok "Keep-alive pinger running every 2 minutes"
+
   ok "Optimization complete"
 }
 
@@ -90,7 +105,7 @@ do_netboot() {
   gw="$(ip -4 route show default | head -1)"
   if [ -n "$gw" ] && ! echo "$gw" | grep -q initcwnd; then
     # shellcheck disable=SC2086
-    ip route change $gw initcwnd 20 initrwnd 20 2>/dev/null
+    ip route change $gw initcwnd 30 initrwnd 30 2>/dev/null
   fi
 
   if command -v ethtool >/dev/null 2>&1; then
@@ -111,6 +126,7 @@ do_status() {
   echo "notsent_lowat   : $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
   echo "rmem/wmem max   : $(sysctl -n net.core.rmem_max 2>/dev/null) / $(sysctl -n net.core.wmem_max 2>/dev/null)"
   echo "Boot service    : $(systemctl is-enabled op-optimizer-net.service 2>/dev/null || echo not-installed)"
+  echo "Keep-alive      : $(systemctl is-active op-keepalive.timer 2>/dev/null || echo not-installed)"
   echo "------------- BadVPN UDPGW -------------"
   if [ -x /usr/local/bin/badvpn-udpgw ]; then /usr/local/bin/op-badvpn status 2>/dev/null || true
   else echo "not installed (run: op-badvpn install)"; fi
@@ -118,6 +134,8 @@ do_status() {
 
 do_restore() {
   need_root
+  systemctl disable --now op-keepalive.timer >/dev/null 2>&1
+  rm -f /etc/systemd/system/op-keepalive.service /etc/systemd/system/op-keepalive.timer /usr/local/bin/op-keepalive
   systemctl disable --now op-optimizer-net.service >/dev/null 2>&1
   rm -f "$SYSCTL_FILE" "$MODULES_FILE" "$LIMITS_FILE" "$SYSTEMD_CONF" "$NET_SERVICE"
   systemctl daemon-reload
