@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# OP VPS Optimizer - BBR + low latency tuning
+# Usage: op-optimizer [apply|status|restore|net-boot|menu]
+set -uo pipefail
+
+ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
+CONF_DIR="/etc/op-optimizer"
+SYSCTL_FILE="/etc/sysctl.d/99-op-optimizer.conf"
+MODULES_FILE="/etc/modules-load.d/op-optimizer.conf"
+LIMITS_FILE="/etc/security/limits.d/99-op-optimizer.conf"
+SYSTEMD_CONF="/etc/systemd/system.conf.d/99-op-optimizer.conf"
+NET_SERVICE="/etc/systemd/system/op-optimizer-net.service"
+PREV_FILE="$CONF_DIR/previous.env"
+
+G='\033[1;32m'; R='\033[1;31m'; Y='\033[1;33m'; C='\033[1;36m'; N='\033[0m'
+ok(){ echo -e "${G}[ OK ]${N} $*"; }
+warn(){ echo -e "${Y}[WARN]${N} $*"; }
+die(){ echo -e "${R}[FAIL]${N} $*"; exit 1; }
+need_root(){ [ "$(id -u)" -eq 0 ] || die "Run as root (sudo)."; }
+default_iface(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+virt_type(){ systemd-detect-virt 2>/dev/null || echo unknown; }
+has_bbr(){ grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; }
+
+do_apply() {
+  need_root
+  mkdir -p "$CONF_DIR"
+  case "$(virt_type)" in
+    openvz|lxc|lxc-libvirt|docker) warn "Container virtualization: host kernel may block some settings." ;;
+  esac
+
+  if [ ! -f "$PREV_FILE" ]; then
+    { echo "PREV_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+      echo "PREV_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)"; } > "$PREV_FILE"
+  fi
+
+  modprobe tcp_bbr 2>/dev/null; modprobe sch_fq 2>/dev/null
+  local cc="cubic" qd="fq_codel"
+  if has_bbr; then cc="bbr"; qd="fq"
+  else warn "BBR unavailable on kernel $(uname -r); using cubic. Upgrade kernel (>=4.9) for BBR."; fi
+  printf 'tcp_bbr\nsch_fq\n' > "$MODULES_FILE"
+
+  local mem_kb maxbuf
+  mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  if   [ "$mem_kb" -lt 1500000 ]; then maxbuf=16777216
+  elif [ "$mem_kb" -lt 4000000 ]; then maxbuf=33554432
+  else maxbuf=67108864; fi
+
+  sed -e "s/@CC@/$cc/g" -e "s/@QDISC@/$qd/g" -e "s/@MAXBUF@/$maxbuf/g" \
+      "$ROOT/config/sysctl-lowlatency.conf" > "$SYSCTL_FILE" || die "Missing config template"
+  sysctl -e -q -p "$SYSCTL_FILE" >/dev/null 2>&1
+  ok "Kernel params applied (cc=$cc qdisc=$qd maxbuf=$((maxbuf/1048576))MB)"
+
+  cat > "$LIMITS_FILE" <<'L'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+L
+  mkdir -p "$(dirname "$SYSTEMD_CONF")"
+  printf '[Manager]\nDefaultLimitNOFILE=1048576\n' > "$SYSTEMD_CONF"
+  systemctl daemon-reexec >/dev/null 2>&1
+  ok "File limits raised"
+
+  cp -f "$ROOT/systemd/op-optimizer-net.service" "$NET_SERVICE"
+  systemctl daemon-reload
+  systemctl enable op-optimizer-net.service >/dev/null 2>&1
+  do_netboot
+  ok "Interface tuning applied + enabled at boot"
+
+  # CPU performance mode, IRQ balancing
+  for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -e "$g" ] && echo performance > "$g" 2>/dev/null
+  done
+  if command -v irqbalance >/dev/null 2>&1; then systemctl enable --now irqbalance >/dev/null 2>&1; fi
+  ok "Optimization complete"
+}
+
+do_netboot() {
+  local iface gw
+  iface="$(default_iface)"
+  [ -n "$iface" ] || { warn "No default interface"; return 0; }
+
+  if has_bbr; then
+    tc qdisc replace dev "$iface" root fq 2>/dev/null || tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
+  else
+    tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
+  fi
+  ip link set dev "$iface" txqueuelen 10000 2>/dev/null
+
+  gw="$(ip -4 route show default | head -1)"
+  if [ -n "$gw" ] && ! echo "$gw" | grep -q initcwnd; then
+    # shellcheck disable=SC2086
+    ip route change $gw initcwnd 20 initrwnd 20 2>/dev/null
+  fi
+
+  if command -v ethtool >/dev/null 2>&1; then
+    ethtool -K "$iface" gro on gso on tso on lro off 2>/dev/null
+    ethtool -C "$iface" adaptive-rx off adaptive-tx off rx-usecs 8 tx-usecs 8 2>/dev/null
+  fi
+  return 0
+}
+
+do_status() {
+  local iface; iface="$(default_iface)"
+  echo -e "${C}======== OP VPS Optimizer status ========${N}"
+  echo "Kernel          : $(uname -r) ($(virt_type))"
+  echo "Interface       : ${iface:-unknown}"
+  echo "Congestion ctrl : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  echo "Default qdisc   : $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  echo "Iface qdisc     : $(tc qdisc show dev "${iface:-lo}" 2>/dev/null | head -1)"
+  echo "notsent_lowat   : $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
+  echo "rmem/wmem max   : $(sysctl -n net.core.rmem_max 2>/dev/null) / $(sysctl -n net.core.wmem_max 2>/dev/null)"
+  echo "Boot service    : $(systemctl is-enabled op-optimizer-net.service 2>/dev/null || echo not-installed)"
+  echo "------------- BadVPN UDPGW -------------"
+  if [ -x /usr/local/bin/badvpn-udpgw ]; then /usr/local/bin/op-badvpn status 2>/dev/null || true
+  else echo "not installed (run: op-badvpn install)"; fi
+}
+
+do_restore() {
+  need_root
+  systemctl disable --now op-optimizer-net.service >/dev/null 2>&1
+  rm -f "$SYSCTL_FILE" "$MODULES_FILE" "$LIMITS_FILE" "$SYSTEMD_CONF" "$NET_SERVICE"
+  systemctl daemon-reload
+  if [ -f "$PREV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$PREV_FILE"
+    [ -n "${PREV_CC:-}" ]    && sysctl -w net.ipv4.tcp_congestion_control="$PREV_CC" >/dev/null 2>&1
+    [ -n "${PREV_QDISC:-}" ] && sysctl -w net.core.default_qdisc="$PREV_QDISC" >/dev/null 2>&1
+  fi
+  sysctl --system >/dev/null 2>&1
+  ok "Settings removed. Reboot to return fully to defaults."
+}
+
+do_menu() {
+  while true; do
+    echo -e "\n${C}=== OP VPS Optimizer ===${N}"
+    echo " 1) Apply BBR + low-latency tuning"
+    echo " 2) Status"
+    echo " 3) Install / repair BadVPN (public)"
+    echo " 4) BadVPN status"
+    echo " 5) Open BadVPN ports in firewall"
+    echo " 6) Restore defaults"
+    echo " 0) Exit"
+    read -rp "Choose: " c </dev/tty
+    case "$c" in
+      1) do_apply ;; 2) do_status ;;
+      3) /usr/local/bin/op-badvpn install ;;
+      4) /usr/local/bin/op-badvpn status ;;
+      5) /usr/local/bin/op-badvpn open ;;
+      6) do_restore ;; 0) exit 0 ;;
+    esac
+  done
+}
+
+case "${1:-menu}" in
+  apply) do_apply ;; status) do_status ;; restore) do_restore ;;
+  net-boot) do_netboot ;; menu) do_menu ;;
+  *) echo "Usage: op-optimizer [apply|status|restore|menu]"; exit 1 ;;
+esac
