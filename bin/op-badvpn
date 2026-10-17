@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# OP BadVPN UDPGW manager - PUBLIC bind (0.0.0.0) by default
+# Usage: op-badvpn install [ports] | status | restart | open | close | remove
+set -uo pipefail
+
+ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
+BIN="/usr/local/bin/badvpn-udpgw"
+UNIT="/etc/systemd/system/badvpn@.service"
+ENV_FILE="/etc/op-optimizer/badvpn.env"
+
+G='\033[1;32m'; R='\033[1;31m'; Y='\033[1;33m'; N='\033[0m'
+ok(){ echo -e "${G}[ OK ]${N} $*"; }
+warn(){ echo -e "${Y}[WARN]${N} $*"; }
+die(){ echo -e "${R}[FAIL]${N} $*"; exit 1; }
+need_root(){ [ "$(id -u)" -eq 0 ] || die "Run as root (sudo)."; }
+
+load_env(){
+  mkdir -p /etc/op-optimizer
+  [ -f "$ENV_FILE" ] || cp -f "$ROOT/config/badvpn.env" "$ENV_FILE"
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  PORTS="${PORTS:-7100 7200 7300}"
+}
+
+build_badvpn() {
+  export DEBIAN_FRONTEND=noninteractive
+  echo "==> Installing build dependencies"
+  apt-get update -y >/dev/null 2>&1
+  apt-get install -y build-essential cmake git pkg-config libssl-dev libnss3-dev libnspr4-dev >/dev/null 2>&1 \
+    || die "Could not install build dependencies"
+  local tmp; tmp="$(mktemp -d)"
+  echo "==> Cloning BadVPN"
+  git clone --depth 1 https://github.com/ambrop72/badvpn.git "$tmp/badvpn" >/dev/null 2>&1 \
+    || { rm -rf "$tmp"; die "git clone failed (check internet/DNS)"; }
+  echo "==> Compiling"
+  mkdir -p "$tmp/build" && cd "$tmp/build" || die "build dir error"
+  cmake "$tmp/badvpn" -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS="-O3 -fcommon -Wno-error" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >"$tmp/cmake.log" 2>&1 \
+    || { tail -20 "$tmp/cmake.log"; rm -rf "$tmp"; die "cmake failed"; }
+  make -j"$(nproc)" >"$tmp/make.log" 2>&1 \
+    || { tail -20 "$tmp/make.log"; rm -rf "$tmp"; die "compile failed"; }
+  install -m 0755 "$tmp/build/udpgw/badvpn-udpgw" "$BIN" || { rm -rf "$tmp"; die "install failed"; }
+  cd / && rm -rf "$tmp"
+  ok "badvpn-udpgw installed at $BIN"
+}
+
+do_install() {
+  need_root; shift 2>/dev/null || true
+  load_env
+  if [ $# -gt 0 ]; then
+    sed -i '/^PORTS=/d' "$ENV_FILE"; echo "PORTS=\"$*\"" >> "$ENV_FILE"; load_env
+  fi
+  if [ ! -x "$BIN" ] || [ "${BADVPN_FORCE:-0}" = "1" ]; then build_badvpn
+  else ok "badvpn-udpgw already installed (BADVPN_FORCE=1 to rebuild)"; fi
+
+  cp -f "$ROOT/systemd/badvpn@.service" "$UNIT"
+  systemctl daemon-reload
+  pkill -x badvpn-udpgw 2>/dev/null
+  for p in $PORTS; do
+    systemctl enable "badvpn@$p.service" >/dev/null 2>&1
+    systemctl restart "badvpn@$p.service" >/dev/null 2>&1
+  done
+  sleep 2
+  do_open
+  do_status
+  warn "BadVPN is PUBLIC ($BIND). Anyone who finds the port can relay UDP through this VPS."
+  warn "Restrict it:  ufw allow from <IP> to any port 7300 proto tcp  (and remove the open rule)"
+}
+
+do_status() {
+  load_env
+  [ -x "$BIN" ] || { echo "badvpn-udpgw not installed. Run: op-badvpn install"; return 1; }
+  local bad=0 st
+  for p in $PORTS; do
+    st="$(systemctl is-active "badvpn@$p.service" 2>/dev/null)"
+    if [ "$st" = "active" ] && ss -lnt 2>/dev/null | grep -q ":$p "; then
+      echo -e "  ${G}●${N} port $p running (listening on $BIND:$p)"
+    else
+      echo -e "  ${R}●${N} port $p NOT running ($st) -> journalctl -u badvpn@$p -n 20"; bad=1
+    fi
+  done
+  return $bad
+}
+
+do_restart(){ need_root; load_env; for p in $PORTS; do systemctl restart "badvpn@$p.service"; done; sleep 1; do_status; }
+
+do_open() {
+  need_root; load_env
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    for p in $PORTS; do ufw allow "$p"/tcp >/dev/null 2>&1; ufw allow "$p"/udp >/dev/null 2>&1; done
+    ok "ufw: opened ports $PORTS"
+  elif command -v iptables >/dev/null 2>&1; then
+    for p in $PORTS; do
+      iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
+      iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT
+    done
+    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+    ok "iptables: opened ports $PORTS (also open them in your provider's cloud firewall if any)"
+  fi
+}
+
+do_close() {
+  need_root; load_env
+  for p in $PORTS; do
+    command -v ufw >/dev/null 2>&1 && { ufw delete allow "$p"/tcp >/dev/null 2>&1; ufw delete allow "$p"/udp >/dev/null 2>&1; }
+    iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null
+    iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null
+  done
+  ok "Firewall rules for $PORTS removed"
+}
+
+do_remove() {
+  need_root; load_env
+  do_close
+  for p in $PORTS; do systemctl disable --now "badvpn@$p.service" >/dev/null 2>&1; done
+  rm -f "$UNIT" "$BIN" "$ENV_FILE"; systemctl daemon-reload
+  ok "BadVPN removed"
+}
+
+case "${1:-status}" in
+  install) do_install "$@" ;; status) do_status ;; restart) do_restart ;;
+  open) do_open ;; close) do_close ;; remove) do_remove ;;
+  *) echo "Usage: op-badvpn [install [ports]|status|restart|open|close|remove]"; exit 1 ;;
+esac
