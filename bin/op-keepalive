@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# OP keep-alive pinger (run by op-keepalive.timer every 2 minutes)
+ENV_FILE=/etc/op-optimizer/keepalive.env
+TARGETS="1.1.1.1 8.8.8.8 9.9.9.9"
+[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+for t in $TARGETS; do
+  ping -c 2 -W 2 -q "$t" >/dev/null 2>&1 && exit 0
+done
+logger -t op-keepalive "all ping targets unreachable"
+exit 0
