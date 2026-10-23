@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════
-#  OP VPS Optimizer – Streaming Edition
-#  High-resolution streaming + VoIP + gaming optimized
-#  Usage: op-optimizer [apply|status|restore|net-boot|menu]
-# ═══════════════════════════════════════════════════════════════
+# OP VPS Optimizer - BBR + low latency tuning
+# Usage: op-optimizer [apply|status|restore|net-boot|menu]
 set -uo pipefail
 
-ROOT="\( (dirname " \)(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")")"
+ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
 CONF_DIR="/etc/op-optimizer"
 SYSCTL_FILE="/etc/sysctl.d/99-op-optimizer.conf"
 MODULES_FILE="/etc/modules-load.d/op-optimizer.conf"
@@ -14,248 +11,149 @@ LIMITS_FILE="/etc/security/limits.d/99-op-optimizer.conf"
 SYSTEMD_CONF="/etc/systemd/system.conf.d/99-op-optimizer.conf"
 NET_SERVICE="/etc/systemd/system/op-optimizer-net.service"
 PREV_FILE="$CONF_DIR/previous.env"
-BACKUP_DIR="/root/op-optimizer-backups"
 
 G='\033[1;32m'; R='\033[1;31m'; Y='\033[1;33m'; C='\033[1;36m'; N='\033[0m'
-ok()   { echo -e "\( {G}[ ✓ ] \){N} $*"; }
-warn() { echo -e "\( {Y}[ ! ] \){N} $*"; }
-die()  { echo -e "\( {R}[ ✗ ] \){N} $*"; exit 1; }
-need_root(){ [ "$(id -u)" -eq 0 ] || die "Run as root (sudo)"; }
-
-default_iface() {
-  ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
-}
-virt_type() { systemd-detect-virt 2>/dev/null || echo "unknown"; }
-has_bbr()   { grep -qw bbr  /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; }
-has_bbr2()  { grep -qw bbr2 /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; }
-has_cake()  { modprobe sch_cake 2>/dev/null; tc qdisc help 2>/dev/null | grep -qw cake; }
+ok(){ echo -e "${G}[ OK ]${N} $*"; }
+warn(){ echo -e "${Y}[WARN]${N} $*"; }
+die(){ echo -e "${R}[FAIL]${N} $*"; exit 1; }
+need_root(){ [ "$(id -u)" -eq 0 ] || die "Run as root (sudo)."; }
+default_iface(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+virt_type(){ systemd-detect-virt 2>/dev/null || echo unknown; }
+has_bbr(){ grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; }
 
 do_apply() {
   need_root
-  mkdir -p "$CONF_DIR" "$BACKUP_DIR"
-
-  local vtype; vtype="$(virt_type)"
-  case "$vtype" in
-    openvz|lxc|lxc-libvirt|docker|podman)
-      warn "Container/OpenVZ ($vtype) detected – some settings may be limited by host kernel"
-      ;;
+  mkdir -p "$CONF_DIR"
+  case "$(virt_type)" in
+    openvz|lxc|lxc-libvirt|docker) warn "Container virtualization: host kernel may block some settings." ;;
   esac
 
-  # One-time backup
   if [ ! -f "$PREV_FILE" ]; then
-    {
-      echo "PREV_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-      echo "PREV_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-      echo "PREV_RMEM=$(sysctl -n net.core.rmem_max 2>/dev/null || true)"
-      echo "PREV_WMEM=$(sysctl -n net.core.wmem_max 2>/dev/null || true)"
-    } > "$PREV_FILE"
-    cp -a /etc/sysctl.d/*.conf "$BACKUP_DIR/" 2>/dev/null || true
+    { echo "PREV_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+      echo "PREV_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)"; } > "$PREV_FILE"
   fi
 
-  # Clean conflicting old lines
-  if [ -f /etc/sysctl.conf ]; then
-    sed -i -E \
-      -e '/^net\.core\.(rmem_max|wmem_max|rmem_default|wmem_default|netdev_max_backlog|default_qdisc)/d' \
-      -e '/^net\.ipv4\.tcp_(congestion_control|rmem|wmem|notsent_lowat|slow_start_after_idle|pacing)/d' \
-      /etc/sysctl.conf
-  fi
-
-  modprobe tcp_bbr 2>/dev/null || true
-  modprobe sch_fq 2>/dev/null || true
-  modprobe sch_fq_codel 2>/dev/null || true
-  modprobe sch_cake 2>/dev/null || true
-
+  modprobe tcp_bbr 2>/dev/null; modprobe sch_fq 2>/dev/null
   local cc="cubic" qd="fq_codel"
-  if has_bbr2; then
-    cc="bbr2"; qd="fq"
-  elif has_bbr; then
-    cc="bbr"; qd="fq"
-  else
-    warn "BBR not available (kernel $(uname -r)). Using cubic. Upgrade kernel ≥4.9 for best streaming."
-  fi
+  if has_bbr; then cc="bbr"; qd="fq"
+  else warn "BBR unavailable on kernel $(uname -r); using cubic. Upgrade kernel (>=4.9) for BBR."; fi
+  printf 'tcp_bbr\nsch_fq\n' > "$MODULES_FILE"
 
-  # CAKE is excellent for mixed streaming + VoIP latency
-  if has_cake; then
-    qd="cake"
-  fi
-
-  printf 'tcp_bbr\nsch_fq\nsch_fq_codel\n' > "$MODULES_FILE"
-  has_cake && echo "sch_cake" >> "$MODULES_FILE"
-
-  # Streaming-oriented buffer sizing (generous but safe)
   local mem_kb maxbuf
   mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-  if   [ "$mem_kb" -lt 1000000 ];  then maxbuf=16777216      # 16 MB
-  elif [ "$mem_kb" -lt 2000000 ];  then maxbuf=33554432      # 32 MB
-  elif [ "$mem_kb" -lt 4000000 ];  then maxbuf=67108864      # 64 MB
-  elif [ "$mem_kb" -lt 8000000 ];  then maxbuf=134217728     # 128 MB
-  else maxbuf=268435456; fi                                   # 256 MB
+  if   [ "$mem_kb" -lt 1500000 ]; then maxbuf=16777216
+  elif [ "$mem_kb" -lt 4000000 ]; then maxbuf=33554432
+  else maxbuf=67108864; fi
 
-  sed -e "s|@CC@|$cc|g" -e "s|@QDISC@|$qd|g" -e "s|@MAXBUF@|$maxbuf|g" \
-      "$ROOT/config/sysctl-streaming.conf" > "$SYSCTL_FILE" || die "Missing config template"
+  sed -e "s/@CC@/$cc/g" -e "s/@QDISC@/$qd/g" -e "s/@MAXBUF@/$maxbuf/g" \
+      "$ROOT/config/sysctl-lowlatency.conf" > "$SYSCTL_FILE" || die "Missing config template"
+  sysctl -e -q -p "$SYSCTL_FILE" >/dev/null 2>&1
+  ok "Kernel params applied (cc=$cc qdisc=$qd maxbuf=$((maxbuf/1048576))MB)"
 
-  sysctl -e -q -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-  ok "Kernel tuned for streaming (cc=$cc  qdisc=\( qd  maxbuf= \)((maxbuf/1048576))MB)"
-
-  # High limits for many concurrent streams
-  cat > "$LIMITS_FILE" <<'EOF'
-* soft nofile 2097152
-* hard nofile 2097152
-root soft nofile 2097152
-root hard nofile 2097152
-* soft nproc 65535
-* hard nproc 65535
-EOF
+  cat > "$LIMITS_FILE" <<'L'
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+L
   mkdir -p "$(dirname "$SYSTEMD_CONF")"
-  cat > "$SYSTEMD_CONF" <<'EOF'
-[Manager]
-DefaultLimitNOFILE=2097152
-DefaultLimitNPROC=65535
-EOF
-  systemctl daemon-reexec >/dev/null 2>&1 || true
-  ok "File descriptor limits raised (2M)"
+  printf '[Manager]\nDefaultLimitNOFILE=1048576\n' > "$SYSTEMD_CONF"
+  systemctl daemon-reexec >/dev/null 2>&1
+  ok "File limits raised"
 
-  # Interface tuning service
   cp -f "$ROOT/systemd/op-optimizer-net.service" "$NET_SERVICE"
   systemctl daemon-reload
-  systemctl enable op-optimizer-net.service >/dev/null 2>&1 || true
+  systemctl enable op-optimizer-net.service >/dev/null 2>&1
   do_netboot
-  ok "Interface low-latency tuning applied + boot service enabled"
+  ok "Interface tuning applied + enabled at boot"
 
-  # CPU performance
+  # CPU performance mode, IRQ balancing
   for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    [ -e "$g" ] && echo performance > "$g" 2>/dev/null || true
+    [ -e "$g" ] && echo performance > "$g" 2>/dev/null
   done
-
-  if command -v irqbalance >/dev/null 2>&1; then
-    systemctl enable --now irqbalance >/dev/null 2>&1 || true
-    ok "irqbalance enabled"
-  fi
-
-  # Disable THP for lower latency under mixed load
-  if [ -w /sys/kernel/mm/transparent_hugepage/enabled ]; then
-    echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-    echo never > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
-  fi
-
-  # Keep-alive
-  cp -f "$ROOT/systemd/op-keepalive.service" /etc/systemd/system/
-  cp -f "$ROOT/systemd/op-keepalive.timer"   /etc/systemd/system/
-  [ -f "$CONF_DIR/keepalive.env" ] || cp -f "$ROOT/config/keepalive.env" "$CONF_DIR/keepalive.env"
-  systemctl daemon-reload
-  systemctl enable --now op-keepalive.timer >/dev/null 2>&1 || true
-  ok "Keep-alive pinger active (every 2 min)"
-
-  ok "Streaming optimization complete – reboot recommended"
+  if command -v irqbalance >/dev/null 2>&1; then systemctl enable --now irqbalance >/dev/null 2>&1; fi
+  ok "Optimization complete"
 }
 
 do_netboot() {
-  local iface; iface="$(default_iface)"
+  local iface gw
+  iface="$(default_iface)"
   [ -n "$iface" ] || { warn "No default interface"; return 0; }
 
-  if has_cake; then
-    tc qdisc replace dev "$iface" root cake bandwidth 0 2>/dev/null || \
-    tc qdisc replace dev "$iface" root fq 2>/dev/null || \
-    tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
-  elif has_bbr; then
-    tc qdisc replace dev "$iface" root fq 2>/dev/null || \
-    tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
+  if has_bbr; then
+    tc qdisc replace dev "$iface" root fq 2>/dev/null || tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
   else
     tc qdisc replace dev "$iface" root fq_codel 2>/dev/null
   fi
+  ip link set dev "$iface" txqueuelen 10000 2>/dev/null
 
-  ip link set dev "$iface" txqueuelen 10000 2>/dev/null || true
-
-  local gw
-  gw="$(ip -4 route show default 2>/dev/null | head -1)"
+  gw="$(ip -4 route show default | head -1)"
   if [ -n "$gw" ] && ! echo "$gw" | grep -q initcwnd; then
     # shellcheck disable=SC2086
-    ip route change $gw initcwnd 40 initrwnd 40 2>/dev/null || true
+    ip route change $gw initcwnd 20 initrwnd 20 2>/dev/null
   fi
 
   if command -v ethtool >/dev/null 2>&1; then
-    ethtool -K "$iface" gro on gso on tso on 2>/dev/null || true
-    ethtool -K "$iface" lro off 2>/dev/null || true
-    ethtool -C "$iface" adaptive-rx off adaptive-tx off rx-usecs 5 tx-usecs 5 2>/dev/null || true
-    ethtool -G "$iface" rx 8192 tx 8192 2>/dev/null || true
+    ethtool -K "$iface" gro on gso on tso on lro off 2>/dev/null
+    ethtool -C "$iface" adaptive-rx off adaptive-tx off rx-usecs 8 tx-usecs 8 2>/dev/null
   fi
-
-  # RPS/RFS for multi-core
-  local cpus; cpus=$(nproc 2>/dev/null || echo 1)
-  if [ "$cpus" -gt 1 ]; then
-    local mask; mask=$(printf '%x' $(( (1 << cpus) - 1 )))
-    echo "$mask" > /sys/class/net/"$iface"/queues/rx-0/rps_cpus 2>/dev/null || true
-    echo 65536 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-    echo 8192  > /sys/class/net/"$iface"/queues/rx-0/rps_flow_cnt 2>/dev/null || true
-  fi
+  return 0
 }
 
 do_status() {
   local iface; iface="$(default_iface)"
-  echo -e "\( {C}══════════ OP VPS Optimizer – Streaming Status ══════════ \){N}"
-  echo "Kernel              : \( (uname -r)  ( \)(virt_type))"
-  echo "Interface           : ${iface:-unknown}"
-  echo "Congestion control  : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo n/a)"
-  echo "Default qdisc       : $(sysctl -n net.core.default_qdisc 2>/dev/null || echo n/a)"
-  echo "Iface qdisc         : \( (tc qdisc show dev " \){iface:-lo}" 2>/dev/null | head -1 || echo n/a)"
-  echo "notsent_lowat       : $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo n/a)"
-  echo "rmem / wmem max     : $(sysctl -n net.core.rmem_max 2>/dev/null || echo n/a) / $(sysctl -n net.core.wmem_max 2>/dev/null || echo n/a)"
-  echo "Boot service        : $(systemctl is-enabled op-optimizer-net.service 2>/dev/null || echo not-installed)"
-  echo "Keep-alive timer    : $(systemctl is-active op-keepalive.timer 2>/dev/null || echo not-installed)"
-  echo "────────────── BadVPN Dual-Bind ──────────────"
-  if [ -x /usr/local/bin/badvpn-udpgw ]; then
-    /usr/local/bin/op-badvpn status 2>/dev/null || true
-  else
-    echo "not installed → run: op-badvpn install"
-  fi
+  echo -e "${C}======== OP VPS Optimizer status ========${N}"
+  echo "Kernel          : $(uname -r) ($(virt_type))"
+  echo "Interface       : ${iface:-unknown}"
+  echo "Congestion ctrl : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+  echo "Default qdisc   : $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  echo "Iface qdisc     : $(tc qdisc show dev "${iface:-lo}" 2>/dev/null | head -1)"
+  echo "notsent_lowat   : $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
+  echo "rmem/wmem max   : $(sysctl -n net.core.rmem_max 2>/dev/null) / $(sysctl -n net.core.wmem_max 2>/dev/null)"
+  echo "Boot service    : $(systemctl is-enabled op-optimizer-net.service 2>/dev/null || echo not-installed)"
+  echo "------------- BadVPN UDPGW -------------"
+  if [ -x /usr/local/bin/badvpn-udpgw ]; then /usr/local/bin/op-badvpn status 2>/dev/null || true
+  else echo "not installed (run: op-badvpn install)"; fi
 }
 
 do_restore() {
   need_root
-  systemctl disable --now op-keepalive.timer >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/op-keepalive.service /etc/systemd/system/op-keepalive.timer
-  systemctl disable --now op-optimizer-net.service >/dev/null 2>&1 || true
+  systemctl disable --now op-optimizer-net.service >/dev/null 2>&1
   rm -f "$SYSCTL_FILE" "$MODULES_FILE" "$LIMITS_FILE" "$SYSTEMD_CONF" "$NET_SERVICE"
   systemctl daemon-reload
-
   if [ -f "$PREV_FILE" ]; then
     # shellcheck disable=SC1090
     . "$PREV_FILE"
-    [ -n "${PREV_CC:-}" ]    && sysctl -w "net.ipv4.tcp_congestion_control=$PREV_CC" >/dev/null 2>&1 || true
-    [ -n "${PREV_QDISC:-}" ] && sysctl -w "net.core.default_qdisc=$PREV_QDISC" >/dev/null 2>&1 || true
+    [ -n "${PREV_CC:-}" ]    && sysctl -w net.ipv4.tcp_congestion_control="$PREV_CC" >/dev/null 2>&1
+    [ -n "${PREV_QDISC:-}" ] && sysctl -w net.core.default_qdisc="$PREV_QDISC" >/dev/null 2>&1
   fi
-  sysctl --system >/dev/null 2>&1 || true
-  ok "Restored. Reboot recommended."
+  sysctl --system >/dev/null 2>&1
+  ok "Settings removed. Reboot to return fully to defaults."
 }
 
 do_menu() {
   while true; do
-    echo -e "\n\( {C}═══ OP VPS Optimizer – Streaming Edition ═══ \){N}"
-    echo " 1) Apply streaming optimizations"
+    echo -e "\n${C}=== OP VPS Optimizer ===${N}"
+    echo " 1) Apply BBR + low-latency tuning"
     echo " 2) Status"
-    echo " 3) Install / repair dual-bind BadVPN"
+    echo " 3) Install / repair BadVPN (public)"
     echo " 4) BadVPN status"
-    echo " 5) Open BadVPN ports (firewall)"
+    echo " 5) Open BadVPN ports in firewall"
     echo " 6) Restore defaults"
     echo " 0) Exit"
     read -rp "Choose: " c </dev/tty
     case "$c" in
-      1) do_apply ;;
-      2) do_status ;;
+      1) do_apply ;; 2) do_status ;;
       3) /usr/local/bin/op-badvpn install ;;
       4) /usr/local/bin/op-badvpn status ;;
       5) /usr/local/bin/op-badvpn open ;;
-      6) do_restore ;;
-      0) exit 0 ;;
+      6) do_restore ;; 0) exit 0 ;;
     esac
   done
 }
 
 case "${1:-menu}" in
-  apply)    do_apply ;;
-  status)   do_status ;;
-  restore)  do_restore ;;
-  net-boot) do_netboot ;;
-  menu)     do_menu ;;
-  *) echo "Usage: op-optimizer [apply|status|restore|net-boot|menu]"; exit 1 ;;
+  apply) do_apply ;; status) do_status ;; restore) do_restore ;;
+  net-boot) do_netboot ;; menu) do_menu ;;
+  *) echo "Usage: op-optimizer [apply|status|restore|menu]"; exit 1 ;;
 esac
