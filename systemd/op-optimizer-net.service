@@ -1,5 +1,5 @@
 [Unit]
-Description=OP Optimizer interface streaming tuning
+Description=OP Optimizer interface low-latency tuning
 After=network-online.target
 Wants=network-online.target
 
