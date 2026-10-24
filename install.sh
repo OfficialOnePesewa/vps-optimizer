@@ -1,114 +1,240 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script Name: VPS Optimizer & BBR Tuner (Debian, Ubuntu, & AlmaLinux Compatible)
-# Description: Applies production-grade network and BBR congestion control tuning
+# Script Name: VPS Optimizer & BBR Tuner (v2)
+# Description: Production-grade network tuning for max speed, low latency
+#              (non-buffering), and connection stability.
+# Compatible : Debian 11+, Ubuntu 20.04+, AlmaLinux 8+, Rocky 8+, CentOS 8+,
+#              RHEL 8+, Fedora 36+
 # ==============================================================================
 
 set -euo pipefail
 
-# Check root privileges
+# ----------------------------
+# Colors
+# ----------------------------
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[+]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+err()  { echo -e "${RED}[-]${NC} $*" >&2; }
+
+# ----------------------------
+# Root check
+# ----------------------------
 if [[ $EUID -ne 0 ]]; then
-   echo "[-] Error: This script must be run as root." 
-   exit 1
+  err "This script must be run as root."
+  exit 1
 fi
 
-echo "[+] Detecting Operating System..."
+# ----------------------------
+# OS detection
+# ----------------------------
+log "Detecting operating system..."
 if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    OS=$ID
-    VERSION_ID=${VERSION_ID:-}
+  . /etc/os-release
+  OS=$ID
+  NAME=${PRETTY_NAME:-$NAME}
 else
-    echo "[-] Error: /etc/os-release not found. Unsupported distribution."
-    exit 1
+  err "/etc/os-release not found. Unsupported distribution."
+  exit 1
 fi
+log "Detected: $NAME ($OS)"
 
-echo "[+] Detected OS: $NAME ($OS)"
-
-# Handle package manager updates and dependency checks if required
-echo "[+] Ensuring core networking tools are available..."
+# ----------------------------
+# Dependencies
+# ----------------------------
+log "Ensuring core networking tools are installed..."
 case "$OS" in
-    ubuntu|debian)
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -yqq
-        apt-get install -yqq procps iproute2 kmod
-        ;;
-    almalinux|rocky|centos|rhel)
-        dnf install -y -q procps-ng iproute kmod
-        ;;
-    *)
-        echo "[!] Warning: Unrecognized distribution ($OS). Proceeding with standard paths..."
-        ;;
+  ubuntu|debian)
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -yqq
+    apt-get install -yqq procps iproute2 kmod ethtool curl
+    ;;
+  almalinux|rocky|centos|rhel|fedora)
+    dnf install -y -q procps-ng iproute kmod ethtool curl
+    ;;
+  *)
+    warn "Unrecognized distribution ($OS). Proceeding with available tools..."
+    ;;
 esac
 
-# 1. Kernel Version Check (BBR requires >= 4.9)
-echo "[+] Checking Linux kernel version..."
-KERNEL_VERSION=$(uname -r | cut -d'.' -f1-2)
-REQUIRED_MAJOR=4
-REQUIRED_MINOR=9
-
-CURRENT_MAJOR=$(echo "$KERNEL_VERSION" | cut -d'.' -f1)
-CURRENT_MINOR=$(echo "$KERNEL_VERSION" | cut -d'.' -f2)
-
-if (( CURRENT_MAJOR < REQUIRED_MAJOR )) || { (( CURRENT_MAJOR == REQUIRED_MAJOR )) && (( CURRENT_MINOR < REQUIRED_MINOR )); }; then
-    echo "[-] Error: Linux kernel version 4.9+ is required for BBR. Current version: $(uname -r)"
-    exit 1
+# ----------------------------
+# Kernel version check (BBR needs >= 4.9, but 5.4+ strongly recommended)
+# ----------------------------
+log "Checking kernel version..."
+KVER=$(uname -r)
+KMAJ=$(echo "$KVER" | cut -d'.' -f1)
+KMIN=$(echo "$KVER" | cut -d'.' -f2)
+if (( KMAJ < 4 )) || { (( KMAJ == 4 )) && (( KMIN < 9 )); }; then
+  err "Kernel $KVER is too old for BBR. Please upgrade to 4.9+ (5.10+ recommended)."
+  exit 1
+fi
+if (( KMAJ < 5 )); then
+  warn "Kernel $KVER works, but 5.10+ is recommended for full BBRv2 + fq_codel benefits."
 fi
 
-# 2. Ensure BBR Module is available and loaded
-echo "[+] Loading BBR kernel module..."
-modprobe tcp_bbr || true
-if ! grep -q "tcp_bbr" /proc/modules; then
-    echo "[-] Warning: tcp_bbr module could not be loaded dynamically. Proceeding with sysctl enforcement..."
+# ----------------------------
+# Load BBR module
+# ----------------------------
+log "Loading BBR kernel module..."
+modprobe tcp_bbr 2>/dev/null || warn "Could not modprobe tcp_bbr (may be built-in or restricted by LXC/OpenVZ)."
+
+AVAILABLE_CC=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+if [[ "$AVAILABLE_CC" != *"bbr"* ]]; then
+  warn "BBR not available in this kernel/container. Falling back to cubic + fq_codel."
+  FALLBACK=1
+else
+  FALLBACK=0
 fi
 
-# 3. Write Optimized Parameters to sysctl.d
+# ----------------------------
+# Detect RAM to scale buffers
+# ----------------------------
+TOTAL_MEM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
+
+# Buffer cap: 5% of RAM, min 64MB, max 256MB
+BUF_MAX_MB=$(( TOTAL_MEM_MB * 5 / 100 ))
+(( BUF_MAX_MB < 64 ))  && BUF_MAX_MB=64
+(( BUF_MAX_MB > 256 )) && BUF_MAX_MB=256
+
+BUF_MAX_BYTES=$(( BUF_MAX_MB * 1024 * 1024 ))
+BUF_DEFAULT=$(( BUF_MAX_MB * 1024 * 1024 / 4 ))
+
+log "RAM: ${TOTAL_MEM_MB} MB → max buffer: ${BUF_MAX_MB} MB"
+
+# ----------------------------
+# Conntrack scaling (if nf_conntrack loaded)
+# ----------------------------
+CONNTRACK_LINE=""
+if [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+  CT_MAX=$(( TOTAL_MEM_MB * 64 ))
+  (( CT_MAX < 65536 ))  && CT_MAX=65536
+  (( CT_MAX > 1048576 )) && CT_MAX=1048576
+  CONNTRACK_LINE="net.netfilter.nf_conntrack_max = $CT_MAX"
+  log "Conntrack max will be set to $CT_MAX"
+fi
+
+# ----------------------------
+# Build sysctl config
+# ----------------------------
 CONFIG_FILE="/etc/sysctl.d/99-vps-optimizer.conf"
-echo "[+] Writing performance parameters to $CONFIG_FILE..."
+BACKUP_FILE="/etc/sysctl.d/99-vps-optimizer.conf.bak.$(date +%s)"
 
-cat << 'EOF' > "$CONFIG_FILE"
-# --- Core BBR & Queue Discipline ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+if [[ -f "$CONFIG_FILE" ]]; then
+  log "Backing up existing config to $BACKUP_FILE"
+  cp "$CONFIG_FILE" "$BACKUP_FILE"
+fi
 
-# --- Socket Memory & Buffer Limits ---
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
+if (( FALLBACK == 1 )); then
+  CC="cubic"
+  QDISC="fq_codel"
+else
+  CC="bbr"
+  QDISC="fq"
+fi
 
-# --- Backlog Queues ---
-net.core.somaxconn = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.netdev_max_backlog = 16384
+log "Writing tuning parameters to $CONFIG_FILE ..."
 
-# --- Port Management & Timers ---
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
+cat > "$CONFIG_FILE" << EOF
+# ==============================================================
+# VPS Optimizer v2 — generated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# ==============================================================
 
-# --- Keepalive Tuning ---
-net.ipv4.tcp_keepalive_time = 300
+# --- Congestion Control & Queue Discipline --------------------
+net.core.default_qdisc = $QDISC
+net.ipv4.tcp_congestion_control = $CC
+
+# --- Socket buffer memory (scaled to ${BUF_MAX_MB} MB) --------
+# tcp_rmem/tcp_wmem: min / default / max
+net.ipv4.tcp_rmem = 4096 131072 $BUF_MAX_BYTES
+net.ipv4.tcp_wmem = 4096 65536  $BUF_MAX_BYTES
+net.core.rmem_max = $BUF_MAX_BYTES
+net.core.wmem_max = $BUF_MAX_BYTES
+net.core.rmem_default = $BUF_DEFAULT
+net.core.wmem_default = $BUF_DEFAULT
+net.core.optmem_max = 65536
+
+# --- Backlog & connection queues (anti-bufferbloat) -----------
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_max_tw_buckets = 262144
+net.ipv4.tcp_max_orphans = 65536
+
+# --- TCP throughput & latency --------------------------------
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_fack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_ecn = 0
+net.ipv4.tcp_notsent_lowat = 16384
+
+# --- Reconnection resilience / keepalive ----------------------
+net.ipv4.tcp_keepalive_time = 120
 net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 2
+
+# --- Port range ----------------------------------------------
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_local_reserved_ports = 32768-60999
+
+# --- Misc stability ------------------------------------------
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+
+# --- IP forwarding (kept off by default; uncomment if needed)
+# net.ipv4.ip_forward = 1
+
+$CONNTRACK_LINE
 EOF
 
-# 4. Apply sysctl settings safely
-echo "[+] Applying kernel parameters..."
-sysctl --system
+# ----------------------------
+# Apply
+# ----------------------------
+log "Applying sysctl settings..."
+if ! sysctl --system > /tmp/sysctl_apply.log 2>&1; then
+  warn "sysctl reported warnings (see /tmp/sysctl_apply.log). Continuing..."
+fi
 
-# 5. Verify Configuration
-ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control)
-ACTIVE_QDISC=$(sysctl -n net.core.default_qdisc)
+# ----------------------------
+# Verify
+# ----------------------------
+ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+ACTIVE_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
 
-echo "=========================================="
-echo "[+] Optimization Complete!"
-echo "    - Operating System:   $NAME"
-echo "    - Congestion Control: $ACTIVE_CC"
-echo "    - Queue Discipline:   $ACTIVE_QDISC"
-echo "=========================================="
+echo
+echo "==============================================="
+echo " VPS Optimization Complete"
+echo "-----------------------------------------------"
+echo " OS               : $NAME"
+echo " Kernel           : $KVER"
+echo " Congestion Ctrl  : $ACTIVE_CC"
+echo " Queue Discipline : $ACTIVE_QDISC"
+echo " Buffer Max       : ${BUF_MAX_MB} MB"
+echo "==============================================="
 
 if [[ "$ACTIVE_CC" == "bbr" && "$ACTIVE_QDISC" == "fq" ]]; then
-    echo "[✔] BBR is successfully active and paired with fq!"
+  log "BBR + fq is active. Optimal low-latency TCP stack enabled."
+elif [[ "$ACTIVE_CC" == "cubic" && "$ACTIVE_QDISC" == "fq_codel" ]]; then
+  warn "Running in fallback mode (cubic + fq_codel). Works well but BBR is faster on lossy links."
 else
-    echo "[!] Notice: Settings applied, but verify virtualization limits (OpenVZ/LXC environments often restrict kernel sysctl adjustments)."
+  warn "Settings applied, but not active. If you are on OpenVZ/LXC, the host must permit these sysctls."
 fi
+
+echo
+log "Done. Reboot is NOT required — settings are live."
