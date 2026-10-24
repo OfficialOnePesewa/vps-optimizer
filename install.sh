@@ -1,21 +1,36 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script Name: VPS Optimizer & BBR Tuner (v2)
+# Script Name: VPS Optimizer & BBR Tuner (v2.1)
 # Description: Production-grade network tuning for max speed, low latency
 #              (non-buffering), and connection stability.
 # Compatible : Debian 11+, Ubuntu 20.04+, AlmaLinux 8+, Rocky 8+, CentOS 8+,
 #              RHEL 8+, Fedora 36+
+# Notes       : Safe against CRLF line endings; self-heals if piped via curl.
 # ==============================================================================
+
+# ---- CRLF self-heal (works even if the file was saved on Windows) ----------
+# If this script was fetched with CRLF endings, re-exec through sed to strip
+# \r before bash parses it. Guard prevents infinite recursion.
+if [[ "${VPS_OPT_LF_FIXED:-0}" != "1" ]] && grep -q $'\r' "${BASH_SOURCE[0]}" 2>/dev/null; then
+  export VPS_OPT_LF_FIXED=1
+  TMP=$(mktemp)
+  sed 's/\r$//' "${BASH_SOURCE[0]}" > "$TMP"
+  chmod +x "$TMP"
+  bash "$TMP" "$@"
+  EXIT_CODE=$?
+  rm -f "$TMP"
+  exit $EXIT_CODE
+fi
 
 set -euo pipefail
 
 # ----------------------------
-# Colors
+# Colors & logging
 # ----------------------------
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
-log()  { echo -e "${GREEN}[+]${NC} $*"; }
-warn() { echo -e "${YELLOW}[!]${NC} $*"; }
-err()  { echo -e "${RED}[-]${NC} $*" >&2; }
+log()  { printf '%b[+]%b %s\n' "$GREEN" "$NC" "$*"; }
+warn() { printf '%b[!]%b %s\n' "$YELLOW" "$NC" "$*"; }
+err()  { printf '%b[-]%b %s\n' "$RED" "$NC" "$*" >&2; }
 
 # ----------------------------
 # Root check
@@ -30,6 +45,7 @@ fi
 # ----------------------------
 log "Detecting operating system..."
 if [[ -f /etc/os-release ]]; then
+  # shellcheck disable=SC1091
   . /etc/os-release
   OS=$ID
   NAME=${PRETTY_NAME:-$NAME}
@@ -58,7 +74,7 @@ case "$OS" in
 esac
 
 # ----------------------------
-# Kernel version check (BBR needs >= 4.9, but 5.4+ strongly recommended)
+# Kernel version check
 # ----------------------------
 log "Checking kernel version..."
 KVER=$(uname -r)
@@ -87,43 +103,42 @@ else
 fi
 
 # ----------------------------
-# Detect RAM to scale buffers
+# RAM-scaled buffers
 # ----------------------------
 TOTAL_MEM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
-
-# Buffer cap: 5% of RAM, min 64MB, max 256MB
 BUF_MAX_MB=$(( TOTAL_MEM_MB * 5 / 100 ))
 (( BUF_MAX_MB < 64 ))  && BUF_MAX_MB=64
 (( BUF_MAX_MB > 256 )) && BUF_MAX_MB=256
-
 BUF_MAX_BYTES=$(( BUF_MAX_MB * 1024 * 1024 ))
 BUF_DEFAULT=$(( BUF_MAX_MB * 1024 * 1024 / 4 ))
-
 log "RAM: ${TOTAL_MEM_MB} MB → max buffer: ${BUF_MAX_MB} MB"
 
 # ----------------------------
-# Conntrack scaling (if nf_conntrack loaded)
+# Conntrack scaling (only if already loaded)
 # ----------------------------
 CONNTRACK_LINE=""
 if [[ -f /proc/sys/net/netfilter/nf_conntrack_max ]]; then
   CT_MAX=$(( TOTAL_MEM_MB * 64 ))
-  (( CT_MAX < 65536 ))  && CT_MAX=65536
+  (( CT_MAX < 65536 ))   && CT_MAX=65536
   (( CT_MAX > 1048576 )) && CT_MAX=1048576
   CONNTRACK_LINE="net.netfilter.nf_conntrack_max = $CT_MAX"
   log "Conntrack max will be set to $CT_MAX"
 fi
 
 # ----------------------------
-# Build sysctl config
+# Backup existing config
 # ----------------------------
 CONFIG_FILE="/etc/sysctl.d/99-vps-optimizer.conf"
-BACKUP_FILE="/etc/sysctl.d/99-vps-optimizer.conf.bak.$(date +%s)"
+BACKUP_FILE="${CONFIG_FILE}.bak.$(date +%s)"
 
 if [[ -f "$CONFIG_FILE" ]]; then
   log "Backing up existing config to $BACKUP_FILE"
   cp "$CONFIG_FILE" "$BACKUP_FILE"
 fi
 
+# ----------------------------
+# Choose CC + qdisc
+# ----------------------------
 if (( FALLBACK == 1 )); then
   CC="cubic"
   QDISC="fq_codel"
@@ -136,7 +151,7 @@ log "Writing tuning parameters to $CONFIG_FILE ..."
 
 cat > "$CONFIG_FILE" << EOF
 # ==============================================================
-# VPS Optimizer v2 — generated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# VPS Optimizer v2.1 — generated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # ==============================================================
 
 # --- Congestion Control & Queue Discipline --------------------
@@ -144,7 +159,6 @@ net.core.default_qdisc = $QDISC
 net.ipv4.tcp_congestion_control = $CC
 
 # --- Socket buffer memory (scaled to ${BUF_MAX_MB} MB) --------
-# tcp_rmem/tcp_wmem: min / default / max
 net.ipv4.tcp_rmem = 4096 131072 $BUF_MAX_BYTES
 net.ipv4.tcp_wmem = 4096 65536  $BUF_MAX_BYTES
 net.core.rmem_max = $BUF_MAX_BYTES
@@ -204,7 +218,7 @@ $CONNTRACK_LINE
 EOF
 
 # ----------------------------
-# Apply
+# Apply sysctl
 # ----------------------------
 log "Applying sysctl settings..."
 if ! sysctl --system > /tmp/sysctl_apply.log 2>&1; then
@@ -212,7 +226,7 @@ if ! sysctl --system > /tmp/sysctl_apply.log 2>&1; then
 fi
 
 # ----------------------------
-# Verify
+# Verification
 # ----------------------------
 ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
 ACTIVE_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
