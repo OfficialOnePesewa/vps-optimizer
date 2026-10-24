@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script Name: VPS Optimizer & BBR Tuner (v2.1)
+# Script Name: VPS Optimizer & BBR Tuner (v2.2)
 # Description: Production-grade network tuning for max speed, low latency
 #              (non-buffering), and connection stability.
+#              v2.2 adds dedicated UDP/QUIC/Hysteria2 tuning.
 # Compatible : Debian 11+, Ubuntu 20.04+, AlmaLinux 8+, Rocky 8+, CentOS 8+,
 #              RHEL 8+, Fedora 36+
 # Notes       : Safe against CRLF line endings; self-heals if piped via curl.
 # ==============================================================================
 
 # ---- CRLF self-heal (works even if the file was saved on Windows) ----------
-# If this script was fetched with CRLF endings, re-exec through sed to strip
-# \r before bash parses it. Guard prevents infinite recursion.
 if [[ "${VPS_OPT_LF_FIXED:-0}" != "1" ]] && grep -q $'\r' "${BASH_SOURCE[0]}" 2>/dev/null; then
   export VPS_OPT_LF_FIXED=1
   TMP=$(mktemp)
@@ -103,7 +102,7 @@ else
 fi
 
 # ----------------------------
-# RAM-scaled buffers
+# RAM-scaled TCP buffers
 # ----------------------------
 TOTAL_MEM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
 BUF_MAX_MB=$(( TOTAL_MEM_MB * 5 / 100 ))
@@ -111,7 +110,21 @@ BUF_MAX_MB=$(( TOTAL_MEM_MB * 5 / 100 ))
 (( BUF_MAX_MB > 256 )) && BUF_MAX_MB=256
 BUF_MAX_BYTES=$(( BUF_MAX_MB * 1024 * 1024 ))
 BUF_DEFAULT=$(( BUF_MAX_MB * 1024 * 1024 / 4 ))
-log "RAM: ${TOTAL_MEM_MB} MB → max buffer: ${BUF_MAX_MB} MB"
+log "RAM: ${TOTAL_MEM_MB} MB → TCP max buffer: ${BUF_MAX_MB} MB"
+
+# ----------------------------
+# UDP/QUIC buffers (independent from TCP)
+# ----------------------------
+# QUIC/Hysteria2 commonly request 7MB+ per socket. We cap at 16MB.
+# wmem is kept moderate — enlarging UDP send buffers mainly adds bufferbloat,
+# since QUIC/Hysteria2 pace in user space.
+UDP_RMEM_MAX=$(( 16 * 1024 * 1024 ))         # 16 MB
+UDP_WMEM_MAX=$(( 16 * 1024 * 1024 ))         # 16 MB
+UDP_RMEM_DEFAULT=$(( 1 * 1024 * 1024 ))      # 1 MB
+UDP_WMEM_DEFAULT=$(( 1 * 1024 * 1024 ))      # 1 MB
+UDP_MEM_PAGES="65536 131072 262144"          # conservative proxy-friendly
+UDP_RMEM_MIN=8192
+UDP_WMEM_MIN=8192
 
 # ----------------------------
 # Conntrack scaling (only if already loaded)
@@ -149,23 +162,38 @@ fi
 
 log "Writing tuning parameters to $CONFIG_FILE ..."
 
+# NOTE: rmem_max/wmem_max are the *shared global caps* used by BOTH TCP and UDP.
+# We take the max of (TCP scaled buffer, UDP 16MB) so neither protocol is starved.
+GLOBAL_RMEM_MAX=$BUF_MAX_BYTES
+GLOBAL_WMEM_MAX=$BUF_MAX_BYTES
+(( UDP_RMEM_MAX > GLOBAL_RMEM_MAX )) && GLOBAL_RMEM_MAX=$UDP_RMEM_MAX
+(( UDP_WMEM_MAX > GLOBAL_WMEM_MAX )) && GLOBAL_WMEM_MAX=$UDP_WMEM_MAX
+
 cat > "$CONFIG_FILE" << EOF
 # ==============================================================
-# VPS Optimizer v2.1 — generated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# VPS Optimizer v2.2 — generated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # ==============================================================
 
 # --- Congestion Control & Queue Discipline --------------------
 net.core.default_qdisc = $QDISC
 net.ipv4.tcp_congestion_control = $CC
 
-# --- Socket buffer memory (scaled to ${BUF_MAX_MB} MB) --------
-net.ipv4.tcp_rmem = 4096 131072 $BUF_MAX_BYTES
-net.ipv4.tcp_wmem = 4096 65536  $BUF_MAX_BYTES
-net.core.rmem_max = $BUF_MAX_BYTES
-net.core.wmem_max = $BUF_MAX_BYTES
+# --- Shared global socket buffer caps -------------------------
+# Single source of truth; higher of (TCP scaled, UDP 16MB) wins.
+net.core.rmem_max = $GLOBAL_RMEM_MAX
+net.core.wmem_max = $GLOBAL_WMEM_MAX
 net.core.rmem_default = $BUF_DEFAULT
 net.core.wmem_default = $BUF_DEFAULT
 net.core.optmem_max = 65536
+
+# --- TCP socket buffer memory (scaled to ${BUF_MAX_MB} MB) ----
+net.ipv4.tcp_rmem = 4096 131072 $BUF_MAX_BYTES
+net.ipv4.tcp_wmem = 4096 65536  $BUF_MAX_BYTES
+
+# --- UDP / QUIC / Hysteria2 tuning ----------------------------
+net.ipv4.udp_mem = $UDP_MEM_PAGES
+net.ipv4.udp_rmem_min = $UDP_RMEM_MIN
+net.ipv4.udp_wmem_min = $UDP_WMEM_MIN
 
 # --- Backlog & connection queues (anti-bufferbloat) -----------
 net.core.somaxconn = 65535
@@ -230,16 +258,20 @@ fi
 # ----------------------------
 ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
 ACTIVE_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+ACTIVE_UDP_MEM=$(sysctl -n net.ipv4.udp_mem 2>/dev/null || echo "n/a")
+ACTIVE_RMEM_MAX=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "n/a")
 
 echo
 echo "==============================================="
-echo " VPS Optimization Complete"
+echo " VPS Optimization Complete (v2.2)"
 echo "-----------------------------------------------"
 echo " OS               : $NAME"
 echo " Kernel           : $KVER"
 echo " Congestion Ctrl  : $ACTIVE_CC"
 echo " Queue Discipline : $ACTIVE_QDISC"
-echo " Buffer Max       : ${BUF_MAX_MB} MB"
+echo " TCP Buffer Max   : ${BUF_MAX_MB} MB"
+echo " Global rmem_max  : $ACTIVE_RMEM_MAX"
+echo " UDP mem pages    : $ACTIVE_UDP_MEM"
 echo "==============================================="
 
 if [[ "$ACTIVE_CC" == "bbr" && "$ACTIVE_QDISC" == "fq" ]]; then
