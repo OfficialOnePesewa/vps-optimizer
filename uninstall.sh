@@ -25,4 +25,4 @@ rm -rf /etc/vps-optimizer
 echo "[4/4] Reloading sysctl..."
 sysctl --system >/dev/null 2>&1 || true
 
-echo "Uninstall complete. Kernel tunables revert on next reboot."
+echo "Uninstall complete."
