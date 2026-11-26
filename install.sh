@@ -55,6 +55,9 @@ fetch() {
          "$REPO_RAW/$rel" -o "$dst" \
       || die "Failed to download $rel"
     [[ -s "$dst" ]] || die "Downloaded $rel is empty"
+    
+    # CRITICAL FIX: Self-heal Windows CRLF line endings automatically
+    sed -i 's/\r$//' "$dst"
 }
 
 install_files() {
