@@ -1,9 +1,3 @@
-
----
-
-### 📄 File: `install.sh`
-*(Create in the root folder)*
-```bash
 #!/usr/bin/env bash
 #
 # VPS Optimizer - Installer
