@@ -1,0 +1,23 @@
+[Unit]
+Description=BadVPN UDP Gateway on port %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/vps-optimizer/badvpn.env
+ExecStart=/usr/local/bin/badvpn-udpgw \
+    --listen-addr ${BADVPN_BIND}:%i \
+    --max-clients ${BADVPN_MAX_CLIENTS} \
+    --max-connections-for-client ${BADVPN_MAX_CONN_PER_CLIENT}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1000000
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
